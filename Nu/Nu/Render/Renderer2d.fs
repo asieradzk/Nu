@@ -10,6 +10,7 @@ open System.Runtime.InteropServices
 open SDL2
 open TiledSharp
 open Prime
+open RenderGraph
 
 /// A mutable sprite value.
 type [<Struct>] SpriteValue =
@@ -108,6 +109,8 @@ type RenderOperation2d =
     | RenderText of TextDescriptor
     | RenderTiles of TilesDescriptor
     | RenderSpineSkeleton of SpineSkeletonDescriptor
+    //RENDERGRAPH:
+    |RenderGraphOperation of RenderGraph
 
 /// Describes a layered rendering operation to a 2d rendering subsystem.
 /// NOTE: mutation is used only for internal caching.
@@ -123,6 +126,8 @@ type RenderMessage2d =
     | LoadRenderPackage2d of string
     | UnloadRenderPackage2d of string
     | ReloadRenderAssets2d
+    //RENDERGRAPH:
+    |ExecuteRenderGraph2d of RenderGraph * single * single * AssetTag
 
 /// Compares layered 2d operations.
 type private LayeredOperation2dComparer () =
@@ -180,7 +185,9 @@ type [<ReferenceEquality>] GlRenderer2d =
           mutable RenderPackageCachedOpt : RenderPackageCached
           mutable RenderAssetCached : RenderAssetCached
           mutable ReloadAssetsRequested : bool
-          LayeredOperations : LayeredOperation2d List }
+          LayeredOperations : LayeredOperation2d List 
+          //RENDERGRAPH:
+          mutable RenderGraphExecutorState : ExecutorState }
 
     static member private invalidateCaches renderer =
         renderer.RenderPackageCachedOpt <- Unchecked.defaultof<_>
@@ -365,6 +372,15 @@ type [<ReferenceEquality>] GlRenderer2d =
         | LoadRenderPackage2d hintPackageUse -> GlRenderer2d.handleLoadRenderPackage hintPackageUse renderer
         | UnloadRenderPackage2d hintPackageDisuse -> GlRenderer2d.handleUnloadRenderPackage hintPackageDisuse renderer
         | ReloadRenderAssets2d -> renderer.ReloadAssetsRequested <- true
+        //RENDERGRAPH:
+        | ExecuteRenderGraph2d (graph, elevation, horizon, assetTag) ->
+            let operation = { 
+                Elevation = elevation
+                Horizon = horizon
+                AssetTag = assetTag
+                RenderOperation2d = RenderGraphOperation graph 
+            }
+            renderer.LayeredOperations.Add operation
 
     static member private handleRenderMessages renderMessages renderer =
         for renderMessage in renderMessages do
@@ -816,6 +832,10 @@ type [<ReferenceEquality>] GlRenderer2d =
         | RenderSpineSkeleton descriptor ->
             GlRenderer2d.renderSpineSkeleton
                 (&descriptor.Transform, descriptor.SpineSkeletonId, descriptor.SpineSkeletonClone, eyeCenter, eyeSize, renderer)
+        //RENDERGRAPH:
+        | RenderGraphOperation graph ->
+            let assetResolver = fun tag -> GlRenderer2d.tryGetRenderAsset tag renderer
+            RenderGraphExecutor.execute graph eyeCenter eyeSize renderer.Viewport assetResolver &renderer.RenderGraphExecutorState
 
     static member private renderLayeredOperations eyeCenter eyeSize renderer =
         for operation in renderer.LayeredOperations do
@@ -895,7 +915,9 @@ type [<ReferenceEquality>] GlRenderer2d =
               RenderPackageCachedOpt = Unchecked.defaultof<_>
               RenderAssetCached = { CachedAssetTagOpt = Unchecked.defaultof<_>; CachedRenderAsset = Unchecked.defaultof<_> }
               ReloadAssetsRequested = false
-              LayeredOperations = List () }
+              LayeredOperations = List () 
+              //RENDERGRAPH:
+              RenderGraphExecutorState = RenderGraphExecutor.createState()}
 
         // fin
         renderer
@@ -907,7 +929,8 @@ type [<ReferenceEquality>] GlRenderer2d =
                 GlRenderer2d.render eyeCenter eyeSize viewport renderMessages renderer
 
         member renderer.CleanUp () =
-
+        //RENDERGRAPH:
+            RenderGraphExecutor.cleanup &renderer.RenderGraphExecutorState
             // destroy sprite batch env
             OpenGL.SpriteBatch.DestroySpriteBatchEnv renderer.SpriteBatchEnv
             OpenGL.Hl.Assert ()
