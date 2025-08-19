@@ -45,7 +45,7 @@ let render world =
 
     RenderGraphHelpers.doBlackSquare "TestSquare" [
         Entity.Position .= v3 0.0f 0.0f 0.0f  // Center of screen
-        Entity.Size .= v3 200.0f 200.0f 0.0f
+        Entity.Size .= v3 100.0f 100.0f 0.0f
         Entity.ElevationLocal .= 5.0f
     ] world
 
