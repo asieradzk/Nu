@@ -61,3 +61,30 @@ packages/
 #######################
 /Nu/Nu.Gaia/TestGroups
 /Nu/Nu.Gaia/Assets/Default/TestAssets
+
+###################
+# Claude Code MCP #
+###################
+.mcp.json
+CLAUDE.md
+
+##################
+# Local Settings #
+##################
+settings.local.json
+settings.json
+
+#############
+# JetBrains #
+#############
+.idea/
+
+##########
+# Claude #
+##########
+.claude/
+
+#########
+# Qwen  #
+#########
+.qwen/
