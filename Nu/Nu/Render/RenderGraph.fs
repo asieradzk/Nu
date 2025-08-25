@@ -1,4 +1,11 @@
-﻿namespace RenderGraph   
+﻿// TEMPORARY: Suppress unused warnings during prototyping - should be removed when implementation is complete
+#nowarn "0025" // Incomplete pattern matches in match expressions
+#nowarn "0040" // This construct is deprecated
+#nowarn "1182" // Unused variables
+#nowarn "0020" // The result of this expression is implicitly ignored
+#pragma warning disable 1182 // Alternative unused variable suppression
+
+namespace RenderGraph   
 
 open System
 open System.Collections.Generic
@@ -606,3 +613,14 @@ module RenderGraphBuilder =
         |> RenderGraph.setOutputAction actionId
         |> RenderGraph.buildDependencyEdges
         |> RenderGraph.validateGraph
+    
+    // Create sprite graph from single .glsl file (with #shader vertex/#shader fragment sections)
+    let createSpriteGraphFromGlsl name glslPath uniforms textures blendMode depthTest =
+        // Note: executor will be configured separately with setSingleFileShader
+        createSpriteGraph name glslPath glslPath uniforms textures blendMode depthTest
+    
+    // Create sprite graph from separate .vert and .frag files  
+    let createSpriteGraphFromSeparateFiles name vertPath fragPath uniforms textures blendMode depthTest =
+        // Note: executor will be configured separately with setSeparateFileShader
+        createSpriteGraph name vertPath fragPath uniforms textures blendMode depthTest
+

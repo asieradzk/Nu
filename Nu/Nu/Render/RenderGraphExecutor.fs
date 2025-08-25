@@ -1,4 +1,18 @@
-﻿namespace Nu
+﻿
+
+
+
+
+
+
+// TEMPORARY: Suppress unused warnings during prototyping - should be removed when implementation is complete
+#nowarn "0025" // Incomplete pattern matches in match expressions
+#nowarn "0040" // This construct is deprecated
+#nowarn "0052" // The value has been copied to ensure the original is not mutated
+#nowarn "1182" // Unused variables
+#nowarn "0020" // The result of this expression is implicitly ignored
+
+namespace Nu
 
 open System
 open System.Collections.Generic
@@ -20,12 +34,11 @@ type RuntimeResource =
     | RuntimeShader of uint32 * Map<string, int> 
     | RuntimeMaterial of uint32 * Map<string, UniformValue> * Map<string, Image AssetTag>
 
-// Shader source info—paths to vertex and fragment shader files.
+// Shader source specification—makes illegal states irrepresentable.
 // This links our abstract shader techniques (like Sprite) to actual GLSL files for compilation.
-type ShaderSource = {
-    VertexPath: string
-    FragmentPath: string
-}
+type ShaderSource =
+    | SingleGlslFile of string                      // Single file with #shader vertex/#shader fragment sections
+    | SeparateFiles of vertex:string * fragment:string    // Separate .vert and .frag files
 
 // Executor's resource cache—stores shaders and materials for reuse across frames.
 // This prevents us from recompiling shaders or recreating materials every frame, which would tank performance in a game with lots of objects.
@@ -51,6 +64,20 @@ type AssetResolver = Image AssetTag -> RenderAsset voption
 
 module RenderGraphExecutor =
     
+    // Configure shader source from separate vertex and fragment files
+    let setSeparateFileShader technique features vertexPath fragmentPath (state: ExecutorState byref) =
+        let shaderSource = SeparateFiles (vertexPath, fragmentPath)
+        let updatedSources = Map.add (technique, features) shaderSource state.Cache.ShaderSources
+        let updatedCache = { state.Cache with ShaderSources = updatedSources }
+        state <- { state with Cache = updatedCache }
+    
+    // Configure shader source from single .glsl file (with #shader vertex/#shader fragment sections)
+    let setSingleFileShader technique features glslPath (state: ExecutorState byref) =
+        let shaderSource = SingleGlslFile glslPath
+        let updatedSources = Map.add (technique, features) shaderSource state.Cache.ShaderSources
+        let updatedCache = { state.Cache with ShaderSources = updatedSources }
+        state <- { state with Cache = updatedCache }
+    
     //TODO: Not flexible change to a different/dynamic technique ASAP
     // Sets up the mapping from shader techniques (like Sprite) to their GLSL file paths.
     // This is super important because it tells the executor where to find the shader code for each technique, including variants like instanced rendering.
@@ -60,10 +87,10 @@ module RenderGraphExecutor =
         let sources = Map.empty
         // Map techniques to shader files
         sources
-        |> Map.add (Sprite, Set.empty) { VertexPath = "Assets/Shaders/basic.vert"; FragmentPath = "Assets/Shaders/basic.frag" }
-        //|> Map.add (Sprite, Set.singleton "Instanced") { VertexPath = "Assets/Shaders/sprite_instanced.vert"; FragmentPath = "Assets/Shaders/sprite.frag" }
-        //|> Map.add (FullscreenPost, Set.empty) { VertexPath = "Assets/Shaders/fullscreen.vert"; FragmentPath = "Assets/Shaders/post.frag" }
-        //|> Map.add (Custom "BlackSquare", Set.empty) { VertexPath = "Assets/Shaders/basic.vert"; FragmentPath = "Assets/Shaders/basic.frag" }
+        |> Map.add (Sprite, Set.empty) (SeparateFiles ("Assets/Shaders/basic.vert", "Assets/Shaders/basic.frag"))
+        //|> Map.add (Sprite, Set.singleton "Instanced") (SeparateFiles ("Assets/Shaders/sprite_instanced.vert", "Assets/Shaders/sprite.frag"))
+        //|> Map.add (FullscreenPost, Set.empty) (SeparateFiles ("Assets/Shaders/fullscreen.vert", "Assets/Shaders/post.frag"))
+        //|> Map.add (Custom "BlackSquare", Set.empty) (SingleGlslFile "Assets/Shaders/black_square.glsl")
     
     // Creates a fresh executor state with an empty cache and no geometry.
     // We need a clean slate for each rendering session to avoid carrying over old data, setting up the cache and buffers so we’re ready to process the graph.
@@ -132,43 +159,80 @@ module RenderGraphExecutor =
             state <- { state with QuadVao = Some vao; QuadVbo = Some vbo; QuadEbo = Some ebo }
             OpenGL.Hl.Assert()
     
-    // Loads vertex and fragment shader source from files or falls back to defaults.
+    // Loads vertex and fragment shader source from ShaderSource specification or falls back to defaults.
     // This makes sure we always have shader code to work with, even if files are missing, which keeps rendering robust during development or on different systems.
-    // It tries to read GLSL files from disk and uses simple default shaders if they’re not found.
-    let private loadShaderFromFiles vertexPath fragmentPath =
+    // It handles both single .glsl files (with #shader vertex/#shader fragment sections) and separate .vert/.frag files.
+    let private loadShaderFromSource (shaderSource: ShaderSource) =
         try
-            // Try to load .glsl files
-            let vertexSource = 
-                if File.Exists(vertexPath) then
-                    File.ReadAllText(vertexPath)
+            match shaderSource with
+            | SingleGlslFile glslPath ->
+                // Single .glsl file with #shader vertex/#shader fragment sections
+                let fullPath = 
+                    if Path.IsPathRooted(glslPath) then glslPath
+                    else Path.Combine(Environment.CurrentDirectory, glslPath)
+                    
+                if File.Exists(fullPath) then
+                    let shaderContent = File.ReadAllText(fullPath)
+                    let vertexStart = shaderContent.IndexOf("#shader vertex")
+                    let fragmentStart = shaderContent.IndexOf("#shader fragment")
+                    
+                    if vertexStart > -1 && fragmentStart > -1 then
+                        let (vertexSource, fragmentSource) =
+                            if vertexStart < fragmentStart then
+                                // Vertex comes first
+                                let vertexSection = shaderContent.Substring(vertexStart + "#shader vertex".Length, fragmentStart - vertexStart - "#shader vertex".Length).Trim()
+                                let fragmentSection = shaderContent.Substring(fragmentStart + "#shader fragment".Length).Trim()
+                                Log.info $"GLSL Debug - Vertex shader:\n{vertexSection}"
+                                Log.info $"GLSL Debug - Fragment shader:\n{fragmentSection}"
+                                (vertexSection, fragmentSection)
+                            else
+                                // Fragment comes first (less common but possible)
+                                let fragmentSection = shaderContent.Substring(fragmentStart + "#shader fragment".Length, vertexStart - fragmentStart - "#shader fragment".Length).Trim()
+                                let vertexSection = shaderContent.Substring(vertexStart + "#shader vertex".Length).Trim()
+                                Log.info $"GLSL Debug - Vertex shader:\n{vertexSection}"
+                                Log.info $"GLSL Debug - Fragment shader:\n{fragmentSection}"
+                                (vertexSection, fragmentSection)
+                        Some (vertexSource, fragmentSource)
+                    else
+                        Log.warn $"Single .glsl file {glslPath} missing required #shader vertex or #shader fragment sections, using defaults"
+                        None
                 else
-                    // Fallback to default vertex shader
-                    """#version 330
-                    layout(location = 0) in vec2 aPosition;
-                    layout(location = 1) in vec2 aTexCoord;
-                    out vec2 vTexCoord;
-                    uniform mat4 uMVP;
-                    void main() {
-                        vTexCoord = aTexCoord;
-                        gl_Position = uMVP * vec4(aPosition, 0.0, 1.0);
-                    }"""
+                    Log.warn $"Single .glsl file {glslPath} not found at {fullPath}, using defaults"
+                    None
             
-            let fragmentSource = 
-                if File.Exists(fragmentPath) then
-                    File.ReadAllText(fragmentPath)
-                else
-                    // Fallback to default fragment shader
-                    """#version 330
-                    in vec2 vTexCoord;
-                    out vec4 FragColor;
-                    uniform vec4 uColor;
-                    void main() {
-                        FragColor = uColor;
-                    }"""
-            
-            Some (vertexSource, fragmentSource)
+            | SeparateFiles (vertexPath, fragmentPath) ->
+                // Separate files approach (.vert/.frag)
+                let vertexSource = 
+                    if File.Exists(vertexPath) then
+                        File.ReadAllText(vertexPath)
+                    else
+                        // Fallback to default vertex shader
+                        """#version 330
+                        layout(location = 0) in vec2 aPosition;
+                        layout(location = 1) in vec2 aTexCoord;
+                        out vec2 vTexCoord;
+                        uniform mat4 uMVP;
+                        void main() {
+                            vTexCoord = aTexCoord;
+                            gl_Position = uMVP * vec4(aPosition, 0.0, 1.0);
+                        }"""
+                
+                let fragmentSource = 
+                    if File.Exists(fragmentPath) then
+                        File.ReadAllText(fragmentPath)
+                    else
+                        // Fallback to default fragment shader
+                        """#version 330
+                        in vec2 vTexCoord;
+                        out vec4 FragColor;
+                        uniform vec4 uColor;
+                        void main() {
+                            FragColor = uColor;
+                        }"""
+                
+                Some (vertexSource, fragmentSource)
         with ex ->
-            Log.error $"Failed to load shader files {vertexPath}, {fragmentPath}: {ex.Message}"
+            Log.error $"Failed to load shader from source: {ex.Message}"
             None
     
     // Gets or creates a shader for a given technique and features, caching it for reuse.
@@ -191,7 +255,7 @@ module RenderGraphExecutor =
             
             match shaderSourceOpt with
             | Some source ->
-                match loadShaderFromFiles source.VertexPath source.FragmentPath with
+                match loadShaderFromSource source with
                 | Some (vertexSource, fragmentSource) ->
                     // Compile shader
                     let programId = OpenGL.Shader.CreateShaderFromStrs(vertexSource, fragmentSource)
