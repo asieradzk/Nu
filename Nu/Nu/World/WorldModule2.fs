@@ -1509,7 +1509,9 @@ module WorldModule2 =
                     for element in hashSet do
                         if element.StaticInPlay then
                             HashSet3dNormalCached.Add element |> ignore<bool>
-                | ShadowPass (_, _, shadowLightType, _, shadowFrustum) -> World.getElements3dInViewFrustum (shadowLightType <> DirectionalLight) true shadowFrustum HashSet3dNormalCached world
+                | ShadowPass (_, indexInfoOpt, shadowLightType, _, shadowFrustum) ->
+                    let shadowInterior = LightType.shouldShadowInterior indexInfoOpt shadowLightType
+                    World.getElements3dInViewFrustum shadowInterior true shadowFrustum HashSet3dNormalCached world
                 | ReflectionPass (_, _) -> ()
                 | NormalPass -> World.getElements3dInView HashSet3dNormalCached world
                 match renderPass with
@@ -1611,6 +1613,7 @@ module WorldModule2 =
                 // render simulant shadows
                 let mutable shadowTexturesCount = 0
                 let mutable shadowMapsCount = 0
+                let mutable shadowCascadesCount = 0
                 for struct (shadowFrustum, light : Entity) in shadowPassDescriptors do
                     let lightType = light.GetLightType world
                     match lightType with
@@ -1620,7 +1623,8 @@ module WorldModule2 =
                             // grab light info
                             let lightId = light.GetId world
                             let shadowOrigin = light.GetPosition world
-                            let shadowCutoff = max (light.GetLightCutoff world) (Constants.Render.NearPlaneDistanceInterior * 2.0f)
+                            let shadowNearDistance = Constants.Render.NearPlaneDistanceInterior
+                            let shadowFarDistance = max (light.GetLightCutoff world) (shadowNearDistance * 2.0f)
 
                             // construct eye rotations
                             let eyeRotations =
@@ -1631,8 +1635,8 @@ module WorldModule2 =
                                   (v3Back, v3Down)      // (+z) back
                                   (v3Forward, v3Down)|] // (-z) front
 
-                            // construct projections
-                            let shadowProjection = Matrix4x4.CreatePerspectiveFieldOfView (MathF.PI_OVER_2, 1.0f, Constants.Render.NearPlaneDistanceInterior, shadowCutoff)
+                            // construct projection
+                            let shadowProjection = Matrix4x4.CreatePerspectiveFieldOfView (MathF.PI_OVER_2, 1.0f, shadowNearDistance, shadowFarDistance)
 
                             // render faces
                             for i in 0 .. dec 6 do
@@ -1650,6 +1654,92 @@ module WorldModule2 =
                         if shadowTexturesCount < Constants.Render.ShadowTexturesMax then
                             World.renderSimulantsInternal (ShadowPass (light.GetId world, None, lightType, light.GetRotation world, shadowFrustum)) world
                             shadowTexturesCount <- inc shadowTexturesCount
+
+                    | CascadedLight ->
+                        if shadowCascadesCount < Constants.Render.ShadowCascadesMax then
+
+                            // compute shadow info
+                            let lightId = light.GetId world
+                            let shadowRotation = light.GetRotation world
+                            let shadowForward = shadowRotation.Down
+                            let shadowUp = shadowForward.OrthonormalUp
+                            let shadowNearDistance = Constants.Render.NearPlaneDistanceInterior
+                            let shadowFarDistance = max (light.GetLightCutoff world) (shadowNearDistance * 2.0f)
+
+                            // compute eye values
+                            let eyeRotation = World.getEye3dRotation world
+                            let eyeForward = eyeRotation.Forward
+                            let eyeUp = eyeForward.OrthonormalUp
+                            let eyeView = Matrix4x4.CreateLookAt (eyeCenter, eyeCenter + eyeForward, eyeUp)
+                            let eyeFov = World.getEye3dFieldOfView world
+                            let eyeAspectRatio = World.getEye3dAspectRatio world
+
+                            // render cascades
+                            for i in 0 .. dec Constants.Render.ShadowCascadeLevels do
+
+                                // compute segment frustum
+                                let segmentNear =
+                                    match i with
+                                    | 0 -> Constants.Render.NearPlaneDistanceInterior
+                                    | _ -> shadowFarDistance * Constants.Render.ShadowCascadeLimits.[dec i]
+                                let segmentFar = shadowFarDistance * Constants.Render.ShadowCascadeLimits.[i]
+                                let segmentProjection = Matrix4x4.CreatePerspectiveFieldOfView (eyeFov, eyeAspectRatio, segmentNear, segmentFar)
+                                let segmentViewProjection = eyeView * segmentProjection
+                                let segmentFrustum = Frustum segmentViewProjection
+
+                                // compute frustum corners and center in world space
+                                let segmentCornersWorld = segmentFrustum.Corners
+                                let segmentCenterWorld = Array.sum segmentCornersWorld / single segmentCornersWorld.Length
+
+                                // compute frustum corner bounds in world space
+                                let segmentViewOrtho = Matrix4x4.CreateLookAt (segmentCenterWorld, segmentCenterWorld + shadowForward, shadowUp)
+                                let mutable minX = Single.MaxValue
+                                let mutable maxX = Single.MinValue
+                                let mutable minY = Single.MaxValue
+                                let mutable maxY = Single.MinValue
+                                let mutable minZ = Single.MaxValue
+                                let mutable maxZ = Single.MinValue
+                                for corner in segmentCornersWorld do
+                                    let cornerView = corner.Transform segmentViewOrtho
+                                    minX <- min minX cornerView.X
+                                    maxX <- max maxX cornerView.X
+                                    minY <- min minY cornerView.Y
+                                    maxY <- max maxY cornerView.Y
+                                    minZ <- min minZ cornerView.Z
+                                    maxZ <- max maxZ cornerView.Z
+
+                                // overflow segment to avoid awkward clipping
+                                let zMult = Constants.Render.ShadowCascadeOverflow
+                                if minZ < 0.0f then minZ <- minZ * zMult else minZ <- minZ / zMult
+                                if maxZ < 0.0f then maxZ <- maxZ / zMult else maxZ <- maxZ * zMult
+
+                                // snap segment center to shadow texel grid in light space to avoid shimmering
+                                //let eyeViewInverse = eyeView.Inverted
+                                //let segmentWidth = maxX - minX
+                                //let segmentHeight = maxY - minY
+                                //let shadowMapSize : Vector2 = world.GeometryViewport.ShadowTextureResolution.V2
+                                //let shadowTexelSize = v2 (segmentWidth / shadowMapSize.X) (segmentHeight / shadowMapSize.Y)
+                                //let segmentCenterShadow = segmentCenterWorld.Transform eyeView
+                                //let segmentCenterSnapped =
+                                //    v3
+                                //        (floor (segmentCenterShadow.X / shadowTexelSize.X) * shadowTexelSize.X)
+                                //        (floor (segmentCenterShadow.Y / shadowTexelSize.Y) * shadowTexelSize.Y)
+                                //        segmentCenterShadow.Z
+                                //let segmentCenterOrtho = segmentCenterSnapped.Transform eyeViewInverse
+                                //let segmentCenterOffset = segmentCenterOrtho - segmentCenterWorld
+                                //minX <- minX + segmentCenterOffset.X
+                                //maxX <- maxX + segmentCenterOffset.X
+                                //minY <- minY + segmentCenterOffset.Y
+                                //maxY <- maxY + segmentCenterOffset.Y
+                                
+                                // compute segment frustum and render
+                                let segmentProjectionOrtho = Matrix4x4.CreateOrthographicOffCenter (minX, maxX, minY, maxY, minZ, maxZ)
+                                let segmentViewProjectionOrtho = segmentViewOrtho * segmentProjectionOrtho
+                                let segmentFrustum = Frustum segmentViewProjectionOrtho
+                                World.renderSimulantsInternal (ShadowPass (lightId, Some (i, segmentViewOrtho, segmentProjectionOrtho), lightType, shadowRotation, segmentFrustum)) world
+
+                            // fin
+                            shadowCascadesCount <- inc shadowCascadesCount
 
                 // render simulants normally
                 World.renderSimulantsInternal NormalPass world
@@ -2176,15 +2266,18 @@ module EntityDispatcherModule =
 [<RequireQualifiedAccess>]
 module EntityPropertyDescriptor =
 
+    /// Check that the described property exists for the given entity.
     let containsPropertyDescriptor propertyName (entity : Entity) world =
         propertyName = Constants.Engine.NamePropertyName ||
         PropertyDescriptor.containsPropertyDescriptor<EntityState> propertyName entity world
 
+    /// Get the property descriptors for the given entity.
     let getPropertyDescriptors (entity : Entity) world =
         let nameDescriptor = { PropertyName = Constants.Engine.NamePropertyName; PropertyType = typeof<string> }
         let propertyDescriptors = PropertyDescriptor.getPropertyDescriptors<EntityState> (Some entity) world
         nameDescriptor :: propertyDescriptors
 
+    /// Get the editor category of the described property.
     let getCategory propertyDescriptor =
         let propertyName = propertyDescriptor.PropertyName
         let baseProperties = Reflection.getPropertyDefinitions typeof<EntityDispatcher>
@@ -2215,6 +2308,7 @@ module EntityPropertyDescriptor =
         elif List.exists (fun (property : PropertyDefinition) -> propertyName = property.PropertyName) rigidBodyProperties then "Physics Properties"
         else "~ More Properties"
 
+    /// Get whether the described property is editable.
     let getEditable propertyDescriptor =
         let propertyName = propertyDescriptor.PropertyName
         if  propertyName = Constants.Engine.OverlayNameOptPropertyName ||
@@ -2234,11 +2328,13 @@ module EntityPropertyDescriptor =
             propertyName = "DegreesLocal" ||
             not (Reflection.isPropertyNonPersistentByName propertyName)
 
+    /// Get the value of the described property for the given entity.
     let getValue propertyDescriptor (entity : Entity) world : obj =
         match PropertyDescriptor.tryGetValue propertyDescriptor entity world with
         | Some value -> value
         | None -> null
 
+    /// Attempt to set the value of the described property for the given entity.
     let trySetValue (value : obj) propertyDescriptor (entity : Entity) world =
 
         // pull string quotes out of string
@@ -2460,27 +2556,33 @@ module GroupDispatcherModule =
 [<RequireQualifiedAccess>]
 module GroupPropertyDescriptor =
 
+    /// Check that the described property exists for the given group.
     let containsPropertyDescriptor propertyName (group : Group) world =
         PropertyDescriptor.containsPropertyDescriptor<GroupState> propertyName group world
 
+    /// Get the property descriptors for the given group.
     let getPropertyDescriptors (group : Group) world =
         PropertyDescriptor.getPropertyDescriptors<GroupState> (Some group) world
 
+    /// Get the editor category of the described property.
     let getCategory propertyDescriptor =
         let propertyName = propertyDescriptor.PropertyName
         if propertyName = "Name" ||  propertyName.EndsWith "Model" then "Ambient Properties"
         elif propertyName = "Persistent" || propertyName = "Elevation" || propertyName = "Visible" then "Built-In Properties"
         else "Xtension Properties"
 
+    /// Get whether the described property is editable.
     let getEditable propertyDescriptor =
         let propertyName = propertyDescriptor.PropertyName
         not (Reflection.isPropertyNonPersistentByName propertyName)
 
+    /// Get the value of the described property for the given group.
     let getValue propertyDescriptor (group : Group) world : obj =
         match PropertyDescriptor.tryGetValue propertyDescriptor group world with
         | Some value -> value
         | None -> null
 
+    /// Attempt to set the value of the described property for the given group.
     let trySetValue (value : obj) propertyDescriptor (group : Group) world =
         
         // pull string quotes out of string
@@ -2676,27 +2778,33 @@ module ScreenDispatcherModule =
 [<RequireQualifiedAccess>]
 module ScreenPropertyDescriptor =
 
+    /// Check that the described property exists for the given screen.
     let containsPropertyDescriptor propertyName (screen : Screen) world =
         PropertyDescriptor.containsPropertyDescriptor<ScreenState> propertyName screen world
 
+    /// Get the property descriptors for the given screen.
     let getPropertyDescriptors (screen : Screen) world =
         PropertyDescriptor.getPropertyDescriptors<ScreenState> (Some screen) world
 
+    /// Get the editor category of the described property.
     let getCategory propertyDescriptor =
         let propertyName = propertyDescriptor.PropertyName
         if propertyName = "Name" || propertyName.EndsWith "Model" then "Ambient Properties"
         elif propertyName = "Persistent" || propertyName = "Incoming" || propertyName = "Outgoing" || propertyName = "SlideOpt" then "Built-In Properties"
         else "Xtension Properties"
 
+    /// Get whether the described property is editable.
     let getEditable propertyDescriptor =
         let propertyName = propertyDescriptor.PropertyName
         not (Reflection.isPropertyNonPersistentByName propertyName)
 
+    /// Get the value of the described property for the given screen.
     let getValue propertyDescriptor (screen : Screen) world : obj =
         match PropertyDescriptor.tryGetValue propertyDescriptor screen world with
         | Some value -> value
         | None -> null
 
+    /// Attempt to set the value of the described property for the given screen.
     let trySetValue (value : obj) propertyDescriptor (screen : Screen) world =
         
         // pull string quotes out of string
@@ -2892,12 +3000,15 @@ module GameDispatcherModule =
 [<RequireQualifiedAccess>]
 module GamePropertyDescriptor =
 
+    /// Check that the described property exists for the game.
     let containsPropertyDescriptor propertyName (game : Game) world =
         PropertyDescriptor.containsPropertyDescriptor<GameState> propertyName game world
 
+    /// Get the property descriptors for the game.
     let getPropertyDescriptors (game : Game) world =
         PropertyDescriptor.getPropertyDescriptors<GameState> (Some game) world
 
+    /// Get the editor category of the described property.
     let getCategory propertyDescriptor =
         let propertyName = propertyDescriptor.PropertyName
         if propertyName = "Name" ||  propertyName.EndsWith "Model" then "Ambient Properties"
@@ -2906,15 +3017,18 @@ module GamePropertyDescriptor =
              "Built-In Properties"
         else "Xtension Properties"
 
+    /// Get whether the described property is editable.
     let getEditable propertyDescriptor =
         let propertyName = propertyDescriptor.PropertyName
         not (Reflection.isPropertyNonPersistentByName propertyName)
 
+    /// Get the value of the described property for the game.
     let getValue propertyDescriptor (game : Game) world : obj =
         match PropertyDescriptor.tryGetValue propertyDescriptor game world with
         | Some value -> value
         | None -> null
 
+    /// Attempt to set the value of the described property for the game.
     let trySetValue (value : obj) propertyDescriptor (game : Game) world =
         
         // pull string quotes out of string
@@ -2933,9 +3047,11 @@ module GamePropertyDescriptor =
             PropertyDescriptor.trySetValue propertyDescriptor value game world |> ignore
             Right ()
 
+/// Simulant PropertyDescriptor functions.
 [<RequireQualifiedAccess>]
 module SimulantPropertyDescriptor =
 
+    /// Check that the described property exists for the given simulant.
     let containsPropertyDescriptor propertyName (simulant : Simulant) world =
         match simulant with
         | :? Entity as entity -> EntityPropertyDescriptor.containsPropertyDescriptor propertyName entity world
@@ -2944,6 +3060,7 @@ module SimulantPropertyDescriptor =
         | :? Game as game -> GamePropertyDescriptor.containsPropertyDescriptor propertyName game world
         | _ -> failwithumf ()
 
+    /// Get the property descriptors for the given simulant.
     let getPropertyDescriptors (simulant : Simulant) world =
         match simulant with
         | :? Entity as entity -> EntityPropertyDescriptor.getPropertyDescriptors entity world
@@ -2952,6 +3069,7 @@ module SimulantPropertyDescriptor =
         | :? Game as game -> GamePropertyDescriptor.getPropertyDescriptors game world
         | _ -> failwithumf ()
 
+    /// Get the editor category of the described property.
     let getCategory propertyDesciptor (simulant : Simulant) =
         match simulant with
         | :? Entity -> EntityPropertyDescriptor.getCategory propertyDesciptor
@@ -2960,6 +3078,7 @@ module SimulantPropertyDescriptor =
         | :? Game -> GamePropertyDescriptor.getCategory propertyDesciptor
         | _ -> failwithumf ()
 
+    /// Get whether the described property is editable.
     let getEditable propertyDesciptor (simulant : Simulant) =
         match simulant with
         | :? Entity -> EntityPropertyDescriptor.getEditable propertyDesciptor
@@ -2968,6 +3087,7 @@ module SimulantPropertyDescriptor =
         | :? Game -> GamePropertyDescriptor.getEditable propertyDesciptor
         | _ -> failwithumf ()
 
+    /// Get the value of the described property for the given simulant.
     let getValue propertyDescriptor (simulant : Simulant) world =
         match simulant with
         | :? Entity as entity -> EntityPropertyDescriptor.getValue propertyDescriptor entity world
@@ -2976,6 +3096,7 @@ module SimulantPropertyDescriptor =
         | :? Game as game -> GamePropertyDescriptor.getValue propertyDescriptor game world
         | _ -> failwithumf ()
 
+    /// Attempt to set the value of the described property for the given simulant.
     let trySetValue value propertyDescriptor (simulant : Simulant) world =
         match simulant with
         | :? Entity as entity -> EntityPropertyDescriptor.trySetValue value propertyDescriptor entity world
