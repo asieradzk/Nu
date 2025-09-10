@@ -1,11 +1,4 @@
-﻿
-
-
-
-
-
-
-// TEMPORARY: Suppress unused warnings during prototyping - should be removed when implementation is complete
+﻿// TEMPORARY: Suppress unused warnings during prototyping
 #nowarn "0025" // Incomplete pattern matches in match expressions
 #nowarn "0040" // This construct is deprecated
 #nowarn "0052" // The value has been copied to ensure the original is not mutated
@@ -21,29 +14,43 @@ open System.Numerics
 open Prime
 open RenderGraph
 
+
+
+// Be warned - orphan types are profilerating
+//check the RenderGraphExecutorShaderDesign for more recent files related to shader batching and instancing especially detectBatching method.
+
+
 // This file is the engine that takes a RenderGraph and makes it real using OpenGL.
 // In the future we want to have per-backend executr, this one would become RenderGraphExecutorOpenGl.fs 
 // It’s like a translator, turning our abstract graph of resources, actions, and dependencies into actual GPU commands for drawing sprites, running shaders, or handling effects.
 // We need this to keep our RenderGraph backend-agnostic, so the same graph can work with OpenGL today and potentially Vulkan or WebGL tomorrow, without changing the graph itself.
 // It’s designed to be efficient—caching shaders, reusing geometry, and cleaning up properly—while staying flexible for complex rendering tasks.
 
+
 // Runtime OpenGL resource handles—our way to track GPU objects like textures or shaders.
-// Each variant holds an OpenGL ID and relevant data, so we can reference and manage them during rendering.
+// Each variant holds an OpenGL ID and relevant data, so we can reference and manage them during rendering. 
 type RuntimeResource =
     | RuntimeTexture of uint32 * int * int
     | RuntimeShader of uint32 * Map<string, int> 
     | RuntimeMaterial of uint32 * Map<string, UniformValue> * Map<string, Image AssetTag>
 
-// Shader source specification—makes illegal states irrepresentable.
-// This links our abstract shader techniques (like Sprite) to actual GLSL files for compilation.
-type ShaderSource =
-    | SingleGlslFile of string                      // Single file with #shader vertex/#shader fragment sections
-    | SeparateFiles of vertex:string * fragment:string    // Separate .vert and .frag files
+// ShaderSource type is now defined in RenderGraphExecutorShaderDesign.fs
+// which comes before this file in the compilation order
+
+/// Compiled shader with pre-computed uniform application
+type CompiledShader = {
+    Program: uint32
+    UniformLocations: Map<string, int32>
+    ApplyProperties: obj -> unit  // Pre-compiled function for fast uniform application
+    ViewProjLocation: int32
+    ModelLocation: int32
+}
 
 // Executor's resource cache—stores shaders and materials for reuse across frames.
 // This prevents us from recompiling shaders or recreating materials every frame, which would tank performance in a game with lots of objects.
 type ExecutorResourceCache = {
-    Shaders: Map<string, RuntimeResource>
+    CompiledShaders: Dictionary<System.RuntimeTypeHandle, CompiledShader>  // Type handle -> compiled shader
+    Shaders: Map<string, RuntimeResource>  // Legacy path for compatibility
     Materials: Map<string, RuntimeResource>
     ShaderSources: Map<ShaderTechnique * Set<string>, ShaderSource>  // Technique+Features -> paths
 }
@@ -56,6 +63,8 @@ type ExecutorState = {
     QuadVao: uint32 option
     QuadVbo: uint32 option
     QuadEbo: uint32 option
+    InstanceVbo: uint32 option  // For instanced rendering
+    ViewProjection: Matrix4x4
 }
 
 /// Asset resolver function type—converts Nu asset tags to actual textures.
@@ -97,6 +106,7 @@ module RenderGraphExecutor =
       // I guess the proper technique is to make things pink so they stand out when shader/material fails? This is for the future.
     let createState () = {
         Cache = { 
+            CompiledShaders = Dictionary<System.RuntimeTypeHandle, CompiledShader>()
             Shaders = Map.empty
             Materials = Map.empty
             ShaderSources = initializeShaderSources ()
@@ -105,6 +115,8 @@ module RenderGraphExecutor =
         QuadVao = None
         QuadVbo = None
         QuadEbo = None
+        InstanceVbo = None
+        ViewProjection = Matrix4x4.Identity
     }
     
     /// Sets up a quad’s geometry (vertices and indices) for 2D rendering, stored in OpenGL buffers.
@@ -235,24 +247,33 @@ module RenderGraphExecutor =
             Log.error $"Failed to load shader from source: {ex.Message}"
             None
     
+    
     // Gets or creates a shader for a given technique and features, caching it for reuse.
     // Compiling shaders is a heavy operation, so we cache them by a unique key (technique + features) to avoid doing it every frame, which keeps our game running smoothly.
     // It looks up the right shader files, compiles them, and stores the result in the cache.
-    let private getOrCreateShaderFromTechnique technique features (state: ExecutorState byref) =
-        let cacheKey = $"""{technique}_{features |> Set.toList |> String.concat "_"}"""
+    let private getOrCreateShaderFromTechnique technique features sourcePathsOpt (state: ExecutorState byref) =
+        // Use provided source paths if available, otherwise generate cache key from technique
+        let (cacheKey, shaderSourceOpt) = 
+            match sourcePathsOpt with
+            | Some (vertPath, fragPath) -> 
+                // Use file paths as cache key for dynamic shaders
+                let key = $"{vertPath}_{fragPath}"
+                (key, Some (SeparateFiles (vertPath, fragPath)))
+            | None ->
+                // Fall back to technique-based lookup
+                let key = $"""{technique}_{features |> Set.toList |> String.concat "_"}"""
+                let source = 
+                    state.Cache.ShaderSources 
+                    |> Map.tryFind (technique, features)
+                    |> Option.orElse (
+                        // Try without features as fallback
+                        state.Cache.ShaderSources |> Map.tryFind (technique, Set.empty)
+                    )
+                (key, source)
         
         match Map.tryFind cacheKey state.Cache.Shaders with
         | Some shader -> shader
         | None ->
-            // Find shader source paths for this technique
-            let shaderSourceOpt = 
-                state.Cache.ShaderSources 
-                |> Map.tryFind (technique, features)
-                |> Option.orElse (
-                    // Try without features as fallback
-                    state.Cache.ShaderSources |> Map.tryFind (technique, Set.empty)
-                )
-            
             match shaderSourceOpt with
             | Some source ->
                 match loadShaderFromSource source with
@@ -284,7 +305,7 @@ module RenderGraphExecutor =
             ()
             
         | ShaderResource (shaderType, _) ->
-            let shader = getOrCreateShaderFromTechnique shaderType.Technique shaderType.Features &state
+            let shader = getOrCreateShaderFromTechnique shaderType.Technique shaderType.Features shaderType.SourcePaths &state
             state <- { state with FrameResources = Map.add resourceId shader state.FrameResources }
         
         | MaterialResource (materialType, _) ->
@@ -365,9 +386,15 @@ module RenderGraphExecutor =
                     match uniformValue with
                     | StaticTransform transform ->
                         transformAbsolute <- transform.Absolute
-                        let scaledPosition = transform.Position * single viewport.DisplayScalar
-                        let scaledSize = transform.Size * single viewport.DisplayScalar
-                        modelMatrix <- Matrix4x4.CreateAffine(scaledPosition, transform.Rotation, scaledSize)
+                        let virtualScalar = (v2iDup viewport.DisplayScalar).V2
+                        let perimeter = transform.Perimeter
+                        let min = perimeter.Min.V2 * virtualScalar
+                        let size = perimeter.Size.V2 * virtualScalar
+                        // Position at center of entity (since quad vertices are [-0.5, 0.5])
+                        let center = min + size * 0.5f
+                        let finalPosition = center.V3
+                        let finalSize = size.V3
+                        modelMatrix <- Matrix4x4.CreateAffine(finalPosition, transform.Rotation, finalSize)
                     | _ -> ()
                 
                 // Set regular uniforms
@@ -380,10 +407,12 @@ module RenderGraphExecutor =
                         | StaticVec2 v -> OpenGL.Gl.Uniform2(location, v.X, v.Y)
                         | StaticVec3 v -> OpenGL.Gl.Uniform3(location, v.X, v.Y, v.Z)
                         | StaticVec4 v -> OpenGL.Gl.Uniform4(location, v.X, v.Y, v.Z, v.W)
-                        | StaticColor c -> OpenGL.Gl.Uniform4(location, c.R, c.G, c.B, c.A)
+                        | StaticColor c -> 
+                            OpenGL.Gl.Uniform4(location, c.R, c.G, c.B, c.A)
                         | StaticMatrix m -> 
                             let matrixArray = m.ToArray()
                             OpenGL.Gl.UniformMatrix4(location, false, matrixArray)
+                        // Dynamic uniforms would need world context - not supported yet
                         | _ -> 
                             Log.warn $"Dynamic uniform '{name}' type not supported yet"
                 
@@ -418,7 +447,12 @@ module RenderGraphExecutor =
                     match state.QuadVao with
                     | Some vao ->
                         OpenGL.Gl.BindVertexArray(vao)
-                        OpenGL.Gl.DrawElements(OpenGL.PrimitiveType.Triangles, 6, OpenGL.DrawElementsType.UnsignedInt, IntPtr.Zero)
+                        if shaderAction.InstanceCount > 1 then
+                            // Instanced rendering
+                            OpenGL.Gl.DrawElementsInstanced(OpenGL.PrimitiveType.Triangles, 6, OpenGL.DrawElementsType.UnsignedInt, IntPtr.Zero, shaderAction.InstanceCount)
+                        else
+                            // Single instance rendering
+                            OpenGL.Gl.DrawElements(OpenGL.PrimitiveType.Triangles, 6, OpenGL.DrawElementsType.UnsignedInt, IntPtr.Zero)
                         OpenGL.Gl.BindVertexArray(0u)
                     | None -> Log.warn "Quad geometry not initialized"
                 | FullscreenTriangle ->
@@ -433,9 +467,10 @@ module RenderGraphExecutor =
         | _ -> 
             Log.warn $"Shader action {actionId} references invalid material"
     
+
     // Executes an action node, deciding what to do based on the action type.
-    // This is the central hub that routes each action to the right handler, whether it’s drawing with a shader, clearing a buffer, or presenting the final image.
-    // It’s critical for keeping the rendering pipeline organized, ensuring each action type is processed correctly without mixing them up.
+    // This is the central hub that routes each action to the right handler, whether it's drawing with a shader, clearing a buffer, or presenting the final image.
+    // It's critical for keeping the rendering pipeline organized, ensuring each action type is processed correctly without mixing them up.
     let executeActionNode actionId actionNode (assetResolver: AssetResolver) eyeCenter eyeSize viewport (state: ExecutorState byref) =
         match actionNode with
         | ShaderAction shaderAction -> executeShaderAction actionId shaderAction assetResolver eyeCenter eyeSize viewport &state
@@ -450,9 +485,15 @@ module RenderGraphExecutor =
     // Main function to execute the entire render graph, turning nodes into OpenGL calls.
     // This is where everything comes together—taking the whole graph and making it show up on screen by processing resources, actions, and sub-graphs in the right order.
     // It uses topological sorting to respect dependencies, ensuring we don’t try to draw before resources are ready.
-    let rec execute graph eyeCenter eyeSize viewport (assetResolver: AssetResolver) (state: ExecutorState byref) =
+    let rec execute graph (eyeCenter: Vector2) (eyeSize: Vector2) viewport (assetResolver: AssetResolver) (state: ExecutorState byref) =
         // Initialize geometry if needed
         initializeQuadGeometry &state
+        
+        // Update view projection matrix
+        let viewProjection = 
+            Matrix4x4.CreateTranslation(-eyeCenter.X, -eyeCenter.Y, 0.0f) *
+            Matrix4x4.CreateScale(2.0f / eyeSize.X, -2.0f / eyeSize.Y, 1.0f)
+        state <- { state with ViewProjection = viewProjection }
         
         // Clear frame resources
         state <- { state with FrameResources = Map.empty }
@@ -479,11 +520,38 @@ module RenderGraphExecutor =
         
         OpenGL.Hl.Assert()
     
+    // Clears the shader cache, forcing recompilation on next use
+    // This is useful when shader files have been modified and need to be reloaded
+    let clearShaderCache (state: ExecutorState byref) =
+        // Delete all compiled shader programs (new system)
+        for KeyValue(_, compiled) in state.Cache.CompiledShaders do
+            if compiled.Program <> 0u then 
+                OpenGL.Gl.DeleteProgram(compiled.Program)
+        
+        // Delete all legacy shader programs
+        for KeyValue(_, resource) in state.Cache.Shaders do
+            match resource with
+            | RuntimeShader (programId, _) when programId <> 0u -> 
+                OpenGL.Gl.DeleteProgram(programId)
+            | _ -> ()
+        
+        // Clear both caches
+        state.Cache.CompiledShaders.Clear()
+        let updatedCache = { state.Cache with Shaders = Map.empty }
+        state <- { state with Cache = updatedCache }
+        
+        OpenGL.Hl.Assert()
+    
     // Cleans up the executor state, freeing GPU resources like shaders and geometry.
-    // This prevents memory leaks by deleting all OpenGL objects when we’re done, ensuring we don’t leave the GPU in a messy state.
+    // This prevents memory leaks by deleting all OpenGL objects when we're done, ensuring we don't leave the GPU in a messy state.
     // It clears the shader cache, deletes quad buffers, and resets the state to a clean slate.
     let cleanup (state: ExecutorState byref) =
-        // Clean up cached shaders
+        // Clean up compiled shaders
+        for KeyValue(_, compiled) in state.Cache.CompiledShaders do
+            if compiled.Program <> 0u then 
+                OpenGL.Gl.DeleteProgram(compiled.Program)
+        
+        // Clean up cached shaders (legacy)
         for KeyValue(_, resource) in state.Cache.Shaders do
             match resource with
             | RuntimeShader (programId, _) when programId <> 0u -> OpenGL.Gl.DeleteProgram(programId)

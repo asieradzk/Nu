@@ -158,6 +158,7 @@ type ShaderResourceType = {
     Technique: ShaderTechnique
     Features: ShaderFeatures
     CacheKey: string  // Auto-generated from technique + features
+    SourcePaths: (string * string) option  // Optional (vertex, fragment) paths for dynamic loading
 }
 
 /// RenderState captures drawing states like blending, depth testing, and culling.
@@ -523,7 +524,14 @@ module RenderGraphBuilder =
     // Create a shared shader resource (persistent for reuse across materials)
     let createShaderResource technique features =
         let cacheKey = $"""{technique}_{features |> Set.toList |> List.map string |> String.concat "_"}"""
-        let shaderResourceType = { Technique = technique; Features = features; CacheKey = cacheKey }
+        let shaderResourceType = { Technique = technique; Features = features; CacheKey = cacheKey; SourcePaths = None }
+        let shaderId = Guid.NewGuid()
+        (shaderId, ShaderResource (shaderResourceType, Persistent))
+    
+    // Create a shared shader resource with explicit source paths
+    let createShaderResourceWithSource technique features vertPath fragPath =
+        let cacheKey = $"""{technique}_{features |> Set.toList |> List.map string |> String.concat "_"}"""
+        let shaderResourceType = { Technique = technique; Features = features; CacheKey = cacheKey; SourcePaths = Some (vertPath, fragPath) }
         let shaderId = Guid.NewGuid()
         (shaderId, ShaderResource (shaderResourceType, Persistent))
     
@@ -623,4 +631,62 @@ module RenderGraphBuilder =
     let createSpriteGraphFromSeparateFiles name vertPath fragPath uniforms textures blendMode depthTest =
         // Note: executor will be configured separately with setSeparateFileShader
         createSpriteGraph name vertPath fragPath uniforms textures blendMode depthTest
+    
+    // Create sprite graph with explicit source paths (dynamic shader loading)
+    let createSpriteGraphWithSource name vertPath fragPath uniforms textures blendMode depthTest =
+        let graph = RenderGraph.empty name
+        
+        // Create shader resource with explicit source paths
+        let (shaderResourceId, shaderResource) = createShaderResourceWithSource Sprite Set.empty vertPath fragPath
+        
+        // Convert old blend mode to new render state
+        let renderState = {
+            Blending = 
+                match blendMode with
+                | Some "Transparent" -> BlendStates.AlphaBlend
+                | Some "Additive" -> BlendStates.Additive
+                | Some "Overwrite" -> BlendStates.Opaque
+                | _ -> BlendStates.AlphaBlend
+            DepthTest = depthTest
+            CullMode = None
+        }
+        
+        // Create material instance
+        let materialInstance = createMaterialInstance shaderResourceId uniforms textures renderState None
+        let (materialId, materialResource, materialResourceType) = createMaterialResource materialInstance true
+        
+        // Create output texture resource
+        let outputTextureType = { Width = 0; Height = 0; Format = Color RGBA8; Samples = 1 }
+        let outputId = Guid.NewGuid()
+        let outputResource = TextureResource (outputTextureType, Transient)
+        
+        let actionId = Guid.NewGuid()
+        
+        let shaderAction = ShaderAction {
+            Material = {
+                Handle = { Id = materialId; Version = 0; ResourceType = materialResourceType }
+                Access = ReadOnly
+                Name = "material"
+            }
+            ColorOutputs = [(0, {
+                Handle = { Id = outputId; Version = 0; ResourceType = outputTextureType }
+                Access = WriteOnly
+                Name = "output"
+            })]
+            DepthOutput = None
+            StencilOutput = None
+            Geometry = Quad
+            InstanceBuffer = None
+            InstanceCount = 1
+            Lifetime = Immediate 
+        }
+        
+        graph
+        |> RenderGraph.addResource shaderResourceId shaderResource
+        |> RenderGraph.addResource materialId materialResource
+        |> RenderGraph.addResource outputId outputResource
+        |> RenderGraph.addAction actionId shaderAction
+        |> RenderGraph.setOutputAction actionId
+        |> RenderGraph.buildDependencyEdges
+        |> RenderGraph.validateGraph
 

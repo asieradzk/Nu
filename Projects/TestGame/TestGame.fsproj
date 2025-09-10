@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
 		<OutputType>Exe</OutputType>
@@ -41,7 +41,10 @@
 	</Target>
 
 	<ItemGroup>
+		<Compile Include="Shaders\ShaderTypes.fs" />
+		<Compile Include="Shaders\TestBasicShader.fs" />
 		<Compile Include="Shaders\RenderGraphSpriteFacet.fs" />
+		
 		<Compile Include="MenuScreens\Components\TitleRender.fs" />
 		<Compile Include="MenuScreens\Components\AnimatedBackground.fs" />
 		<Compile Include="MenuScreens\MainMenuScreen.fs" />

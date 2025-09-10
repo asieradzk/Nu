@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
 		<TargetFramework>net9.0</TargetFramework>
@@ -90,7 +90,9 @@
 		<Compile Include="Physics\PhysicsEngine3d.fs" />
 		<Compile Include="Render\RendererPrelude.fs" />
 		<Compile Include="Render\RenderGraph.fs" />
+		<Compile Include="Render\RenderGraphExecutorShaderDesign.fs" />
 		<Compile Include="Render\RenderGraphExecutor.fs" />
+		
 		<Compile Include="Render\Renderer2d.fs" />
 
 		<Compile Include="Render\Renderer3d.fs" />

@@ -2,11 +2,11 @@
 
 open Nu
 open System.Numerics
-open MyGame
+open MyGame.RenderGraphSpriteFacet
+open MyGame  // For TestBasicShader type
 
-
-let SkyImage : Image AssetTag = { PackageName = "MyGame"; AssetName = "cartoonsky" }
-let CloudImage : Image AssetTag = { PackageName = "MyGame"; AssetName = "cartooncloudsmall" }
+let SkyImage : Image AssetTag = { PackageName = "MyGame"; AssetName = "cartoonsky_f" }
+let CloudImage : Image AssetTag = { PackageName = "MyGame"; AssetName = "cartooncloudsmall_f" }
 let CloudSpeed = 30f
 
 let CloudScale = 0.3f
@@ -26,6 +26,9 @@ let render world =
         Entity.Layout .= Manual 
     ] world
 
+
+    
+
     let cloudWidth = 100.0f
     // Uses modulo to loop the cloud position: as (time * speed) 
     //increases, % wraps it within 0 to (screen width + cloud width), 
@@ -41,12 +44,24 @@ let render world =
         Entity.Size .= v3 256f 256f 0f
         Entity.Color .= colorWithOpacity
         Entity.ElevationLocal .= 1.0f    
+        
     ] world
 
-    RenderGraphHelpers.doBlackSquare "TestSquare" [
-        Entity.Position .= v3 0.0f 0.0f 0.0f  // Center of screen
-        Entity.Size .= v3 100.0f 100.0f 0.0f
-        Entity.ElevationLocal .= 5.0f
+    // Render graph shader system demonstration
+    
+    
+    RenderGraphHelpers.doEntityShader "StaticRedSquare" [
+        Entity.ShaderPackage .= TestBasicShader.red 
+        Entity.Position .= v3 -100.0f 0.0f 0.0f
+        Entity.Size .= v3 50.0f 50.0f 0.0f
+        Entity.ElevationLocal .= 7.0f
+    ] world
+    
+   
+    RenderGraphHelpers.doEntityShader "DynamicAnimatedSquare" [
+        Entity.ShaderPackage @= TestBasicShader.create Color.White world.ClockTime 0.5f  
+        Entity.Size .= v3 75.0f 75.0f 0.0f
+        Entity.ElevationLocal .= 8.0f
     ] world
 
 
