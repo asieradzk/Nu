@@ -42,7 +42,10 @@ module Xtension =
         | true ->
 #if DEBUG
             if property.PropertyType <> propertyRef.PropertyType then
-                failwith "Cannot change the type of an existing Xtension property."
+                // Allow type changes for F# Interactive reloads (Gaia development)
+                // Check if both types have the same name (same type, different assembly)
+                if property.PropertyType.FullName <> propertyRef.PropertyType.FullName then
+                    failwith "Cannot change the type of an existing Xtension property."
 #endif
             if xtension.Imperative then
                 propertyRef.PropertyValue <- property.PropertyValue
