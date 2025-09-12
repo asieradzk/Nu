@@ -5,11 +5,39 @@ namespace Nu
 open System
 open System.Collections.Generic
 open System.Diagnostics
+open System.Diagnostics.Tracing
 open System.Numerics
 open System.Reflection
 open System.Threading
 open SDL2
 open Prime
+
+/// GC event listener. Currently just logs whenever an object larger than 85k is allocated to notify user of possible
+/// LOH churn.
+type private GcEventListener () =
+    inherit EventListener ()
+
+    static let mutable InstanceOpt = null
+
+    override this.OnEventSourceCreated (eventSource : EventSource) =
+        if eventSource.Name = "Microsoft-Windows-DotNETRuntime" then
+            let gcEventsKeyword = Branchless.reinterpret 0x1L
+            base.EnableEvents (eventSource, EventLevel.Verbose, gcEventsKeyword)
+
+    override this.OnEventWritten(eventData: EventWrittenEventArgs) =
+        if eventData.EventName = "GCAllocationTick_V4" && notNull eventData.Payload && eventData.Payload.Count >= 9 then
+            match eventData.Payload.[8] with
+            | :? uint64 as allocSize when allocSize >= uint64 Constants.Runtime.LohSize ->
+                match eventData.Payload.[5] with
+                | :? string as typeName ->
+                    Log.info ("Allocated object of type '" + typeName + "' of size " + string allocSize + " on the LOH.")
+                | _ -> ()
+            | _ -> ()
+
+    /// Initialize listener when gcDebug is true.
+    static member init gcDebug =
+        if gcDebug && isNull InstanceOpt then
+            InstanceOpt <- new GcEventListener ()
 
 /// Nu initialization functions.
 /// NOTE: this is a type in order to avoid creating a module name that may clash with the namespace name in an
@@ -91,6 +119,9 @@ type Nu () =
 
             // init user-defined initialization process
             let result = userInit ()
+
+            // init GC event listener
+            GcEventListener.init Constants.Runtime.GcDebug
 
             // init vsync
             Vsync.Init Constants.Engine.RunSynchronously
@@ -220,7 +251,7 @@ module WorldModule4 =
                  AnimatedModelFacet ()
                  TerrainFacet ()
                  EditVolumeFacet ()
-                 TraversalInterpoledFacet ()
+                 TraversalInterpolatedFacet ()
                  NavBodyFacet ()
                  FollowerFacet ()
                  Freezer3dFacet ()]
@@ -256,20 +287,20 @@ module WorldModule4 =
                     { worldExtension with Dispatchers = { worldExtension.Dispatchers with Facets = Map.add facetName facet worldExtension.Dispatchers.Facets }})
                     worldExtension pluginFacets
             let worldExtension =
-                Array.fold (fun worldExtension (entityDispatcherName, entityDispatcher) ->
-                    { worldExtension with Dispatchers = { worldExtension.Dispatchers with EntityDispatchers = Map.add entityDispatcherName entityDispatcher worldExtension.Dispatchers.EntityDispatchers }})
+                Array.fold (fun worldExtension (dispatcherName, dispatcher) ->
+                    { worldExtension with Dispatchers = { worldExtension.Dispatchers with EntityDispatchers = Map.add dispatcherName dispatcher worldExtension.Dispatchers.EntityDispatchers }})
                     worldExtension pluginEntityDispatchers
             let worldExtension =
-                Array.fold (fun worldExtension (groupDispatcherName, groupDispatcher) ->
-                    { worldExtension with Dispatchers = { worldExtension.Dispatchers with GroupDispatchers = Map.add groupDispatcherName groupDispatcher worldExtension.Dispatchers.GroupDispatchers }})
+                Array.fold (fun worldExtension (dispatcherName, dispatcher) ->
+                    { worldExtension with Dispatchers = { worldExtension.Dispatchers with GroupDispatchers = Map.add dispatcherName dispatcher worldExtension.Dispatchers.GroupDispatchers }})
                     worldExtension pluginGroupDispatchers
             let worldExtension =
-                Array.fold (fun worldExtension (screenDispatcherName, screenDispatcher) ->
-                    { worldExtension with Dispatchers = { worldExtension.Dispatchers with ScreenDispatchers = Map.add screenDispatcherName screenDispatcher worldExtension.Dispatchers.ScreenDispatchers }})
+                Array.fold (fun worldExtension (dispatcherName, dispatcher) ->
+                    { worldExtension with Dispatchers = { worldExtension.Dispatchers with ScreenDispatchers = Map.add dispatcherName dispatcher worldExtension.Dispatchers.ScreenDispatchers }})
                     worldExtension pluginScreenDispatchers
             let worldExtension =
-                Array.fold (fun worldExtension (gameDispatcherName, gameDispatcher) ->
-                    { worldExtension with Dispatchers = { worldExtension.Dispatchers with GameDispatchers = Map.add gameDispatcherName gameDispatcher worldExtension.Dispatchers.GameDispatchers }})
+                Array.fold (fun worldExtension (dispatcherName, dispatcher) ->
+                    { worldExtension with Dispatchers = { worldExtension.Dispatchers with GameDispatchers = Map.add dispatcherName dispatcher worldExtension.Dispatchers.GameDispatchers }})
                     worldExtension pluginGameDispatchers
             world.WorldState <- { world.WorldState with WorldExtension = worldExtension }
 
@@ -470,7 +501,7 @@ module WorldModule4 =
             let imGui = ImGui (false, outerViewport.Bounds.Size)
             let physicsEngine2d = PhysicsEngine2d.make (Constants.Physics.GravityDefault * Constants.Engine.Meter2d)
             let physicsEngine3d = PhysicsEngine3d.make Constants.Physics.GravityDefault
-            let rendererPhysics3dOpt = new RendererPhysics3d ()
+            let joltDebugRendererImGuiOpt = new JoltDebugRendererImGui ()
             let rendererProcess =
                 if Constants.Engine.RunSynchronously
                 then RendererInline () :> RendererProcess
@@ -493,7 +524,7 @@ module WorldModule4 =
 
             // make the world
             let world =
-                World.makePlus plugin eventGraph jobGraph geometryViewport rasterViewport outerViewport dispatchers quadtree octree config (Some sdlDeps) imGui physicsEngine2d physicsEngine3d (Some rendererPhysics3dOpt) rendererProcess audioPlayer activeGameDispatcher
+                World.makePlus plugin eventGraph jobGraph geometryViewport rasterViewport outerViewport dispatchers quadtree octree config (Some sdlDeps) imGui physicsEngine2d physicsEngine3d (Some joltDebugRendererImGuiOpt) rendererProcess audioPlayer activeGameDispatcher
 
             // add the keyed values
             for (key, value) in plugin.MakeKeyedValues world do

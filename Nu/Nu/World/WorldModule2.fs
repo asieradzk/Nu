@@ -955,15 +955,21 @@ module WorldModule2 =
         static member private processCoroutines (world : World) =
             if world.Advancing then
                 let coroutines = World.getCoroutines world
-                let coroutines' =
-                    OMap.fold (fun coroutines id (pred, coroutine) ->
-                        match Coroutine.step pred coroutine world.GameTime world with
-                        | CoroutineCancelled -> coroutines
-                        | CoroutineCompleted -> coroutines
-                        | CoroutineProgressing coroutine' -> OMap.add id (pred, coroutine') coroutines)
-                        (OMap.makeEmpty (OMap.getComparer coroutines) (OMap.getConfig coroutines))
+                let coroutinesRemaining =
+                    OMap.fold (fun coroutines id (scheduledTime, pred, coroutine) ->
+                        if pred () then
+                            if scheduledTime <= world.GameTime then
+                                match coroutine () with
+                                | Sleep (duration, continuation) ->
+                                    OMap.add id (scheduledTime + duration, pred, continuation) coroutines
+                                | Cancel | Complete -> coroutines
+                            else OMap.add id (scheduledTime, pred, coroutine) coroutines
+                        else coroutines)
+                        (OMap.makeEmpty (OMap.comparer coroutines) (OMap.config coroutines))
                         coroutines
-                World.setCoroutines coroutines' world
+                let coroutineKeys = coroutines |> SArray.ofSeq |> SArray.map fst
+                let coroutinesAdded = OMap.removeMany coroutineKeys (World.getCoroutines world)
+                World.setCoroutines (OMap.concat coroutinesRemaining coroutinesAdded) world
 
         static member private processTasklet simulant tasklet (taskletsNotRun : OMap<Simulant, World Tasklet UList>) (world : World) =
             let shouldRun =
@@ -976,7 +982,7 @@ module WorldModule2 =
             else
                 match taskletsNotRun.TryGetValue simulant with
                 | (true, taskletList) -> OMap.add simulant (UList.add tasklet taskletList) taskletsNotRun
-                | (false, _) -> OMap.add simulant (UList.singleton (OMap.getConfig taskletsNotRun) tasklet) taskletsNotRun
+                | (false, _) -> OMap.add simulant (UList.singleton (OMap.config taskletsNotRun) tasklet) taskletsNotRun
 
         static member private processTasklets (world : World) =
             let tasklets = World.getTasklets world
@@ -989,7 +995,7 @@ module WorldModule2 =
                         else taskletsNotRun)
                         taskletsNotRun
                         taskletList)
-                    (OMap.makeEmpty HashIdentity.Structural (OMap.getConfig tasklets))
+                    (OMap.makeEmpty HashIdentity.Structural (OMap.config tasklets))
                     tasklets
             let taskletsNotRun = OMap.filter (fun simulant _ -> World.getExists simulant world) taskletsNotRun
             World.restoreTasklets taskletsNotRun world
@@ -1488,6 +1494,49 @@ module WorldModule2 =
             | OutgoingState transitionTime -> World.renderScreenTransition5 transitionTime world.Eye2dSize renderPass (screen.GetOutgoing world) world
             | IdlingState _ -> ()
 
+        static member private renderSimulantsInternal8
+            game screenOpt groups (groupsInvisible : _ HashSet)
+            (elements3d : _ Octelement HashSet) (elements2d : _ Quadelement HashSet)
+            renderPass (world : World) =
+
+            // render game
+            World.renderGame renderPass game world
+
+            // render screens
+            match screenOpt with
+            | Some screen -> World.renderScreen renderPass screen world
+            | None -> ()
+
+            // render screen transition
+            match World.getSelectedScreenOpt world with
+            | Some selectedScreen -> World.renderScreenTransition renderPass selectedScreen world
+            | None -> ()
+
+            // render groups
+            for group in groups do
+                if not (groupsInvisible.Contains group) then
+                    World.renderGroup renderPass group world
+
+            // render entities
+            world.Timers.RenderEntityMessagesTimer.Restart ()
+            if world.Unaccompanied || groupsInvisible.Count = 0 then
+                for element in elements3d do
+                    if element.VisibleInView then
+                        World.renderEntity renderPass element.Entry world
+            else
+                for element in elements3d do
+                    if element.VisibleInView && not (groupsInvisible.Contains element.Entry.Group) then
+                        World.renderEntity renderPass element.Entry world
+            if world.Unaccompanied || groupsInvisible.Count = 0 then
+                for element in elements2d do
+                    if element.VisibleInView then
+                        World.renderEntity renderPass element.Entry world
+            else
+                for element in elements2d do
+                    if element.VisibleInView && not (groupsInvisible.Contains element.Entry.Group) then
+                        World.renderEntity renderPass element.Entry world
+            world.Timers.RenderEntityMessagesTimer.Stop ()
+
         static member private renderSimulantsInternal renderPass (world : World) =
 
             // use a finally block to free cached values
@@ -1509,8 +1558,8 @@ module WorldModule2 =
                     for element in hashSet do
                         if element.StaticInPlay then
                             HashSet3dNormalCached.Add element |> ignore<bool>
-                | ShadowPass (_, indexInfoOpt, shadowLightType, _, shadowFrustum) ->
-                    let shadowInterior = LightType.shouldShadowInterior indexInfoOpt shadowLightType
+                | ShadowPass (_, _, shadowLightType, _, shadowFrustum) ->
+                    let shadowInterior = LightType.shouldShadowInterior shadowLightType
                     World.getElements3dInViewFrustum shadowInterior true shadowFrustum HashSet3dNormalCached world
                 | ReflectionPass (_, _) -> ()
                 | NormalPass -> World.getElements3dInView HashSet3dNormalCached world
@@ -1521,43 +1570,8 @@ module WorldModule2 =
                 | NormalPass -> World.getElements2dInView HashSet2dNormalCached world
                 world.Timers.RenderGatherTimer.Stop ()
 
-                // render game
-                World.renderGame renderPass game world
-
-                // render screens
-                match screenOpt with
-                | Some screen -> World.renderScreen renderPass screen world
-                | None -> ()
-
-                // render screen transition
-                match World.getSelectedScreenOpt world with
-                | Some selectedScreen -> World.renderScreenTransition renderPass selectedScreen world
-                | None -> ()
-
-                // render groups
-                for group in groups do
-                    if not (groupsInvisible.Contains group) then
-                        World.renderGroup renderPass group world
-
-                // render entities
-                world.Timers.RenderEntityMessagesTimer.Restart ()
-                if world.Unaccompanied || groupsInvisible.Count = 0 then
-                    for element in HashSet3dNormalCached do
-                        if element.VisibleInView then
-                            World.renderEntity renderPass element.Entry world
-                else
-                    for element in HashSet3dNormalCached do
-                        if element.VisibleInView && not (groupsInvisible.Contains element.Entry.Group) then
-                            World.renderEntity renderPass element.Entry world
-                if world.Unaccompanied || groupsInvisible.Count = 0 then
-                    for element in HashSet2dNormalCached do
-                        if element.VisibleInView then
-                            World.renderEntity renderPass element.Entry world
-                else
-                    for element in HashSet2dNormalCached do
-                        if element.VisibleInView && not (groupsInvisible.Contains element.Entry.Group) then
-                            World.renderEntity renderPass element.Entry world
-                world.Timers.RenderEntityMessagesTimer.Stop ()
+                // render simulants
+                World.renderSimulantsInternal8 game screenOpt groups groupsInvisible HashSet3dNormalCached HashSet2dNormalCached renderPass world
 
             // free cached values
             finally
@@ -1641,7 +1655,7 @@ module WorldModule2 =
                             // render faces
                             for i in 0 .. dec 6 do
                                 let (eyeForward, eyeUp) = eyeRotations.[i]
-                                let shadowRotation = Quaternion.CreateLookAt (shadowOrigin, shadowOrigin + eyeForward, eyeUp)
+                                let shadowRotation = Quaternion.CreateLookAt (eyeForward, eyeUp)
                                 let shadowView = Matrix4x4.CreateLookAt (shadowOrigin, shadowOrigin + eyeForward, eyeUp)
                                 let shadowViewProjection = shadowView * shadowProjection
                                 let shadowFrustum = Frustum shadowViewProjection
@@ -1650,9 +1664,34 @@ module WorldModule2 =
                             // fin
                             shadowMapsCount <- inc shadowMapsCount
 
-                    | SpotLight (_, _) | DirectionalLight ->
+                    | SpotLight (_, _) ->
                         if shadowTexturesCount < Constants.Render.ShadowTexturesMax then
                             World.renderSimulantsInternal (ShadowPass (light.GetId world, None, lightType, light.GetRotation world, shadowFrustum)) world
+                            shadowTexturesCount <- inc shadowTexturesCount
+
+                    | DirectionalLight ->
+                        if shadowTexturesCount < Constants.Render.ShadowTexturesMax then
+
+                            // compute cull frustum
+                            let shadowOrigin = light.GetPosition world
+                            let shadowRotation = light.GetRotation world
+                            let shadowForward = shadowRotation.Down
+                            let shadowUp = shadowForward.OrthonormalUp
+                            let shadowNearDistance = Constants.Render.NearPlaneDistanceInterior
+                            let shadowFarDistance = max (light.GetLightCutoff world) (shadowNearDistance * 2.0f)
+                            let cullView = Matrix4x4.CreateLookAt (shadowOrigin, shadowOrigin + shadowForward, shadowUp)
+                            let cullProjection =
+                                Matrix4x4.CreateOrthographic
+                                    (shadowFarDistance * +2.0f * inc Constants.Render.ShadowDirectionalMarginRatioCull,
+                                     shadowFarDistance * +2.0f * inc Constants.Render.ShadowDirectionalMarginRatioCull,
+                                     shadowFarDistance * -1.0f * inc Constants.Render.ShadowDirectionalMarginRatioCull,
+                                     shadowFarDistance * +1.0f * inc Constants.Render.ShadowDirectionalMarginRatioCull)
+                            let cullFrustum = Frustum (cullView * cullProjection)
+
+                            // render
+                            World.renderSimulantsInternal (ShadowPass (light.GetId world, None, lightType, light.GetRotation world, cullFrustum)) world
+
+                            // fin
                             shadowTexturesCount <- inc shadowTexturesCount
 
                     | CascadedLight ->
@@ -1660,6 +1699,7 @@ module WorldModule2 =
 
                             // compute shadow info
                             let lightId = light.GetId world
+                            let shadowOrigin = light.GetPosition world
                             let shadowRotation = light.GetRotation world
                             let shadowForward = shadowRotation.Down
                             let shadowUp = shadowForward.OrthonormalUp
@@ -1674,69 +1714,89 @@ module WorldModule2 =
                             let eyeFov = World.getEye3dFieldOfView world
                             let eyeAspectRatio = World.getEye3dAspectRatio world
 
-                            // render cascades
-                            for i in 0 .. dec Constants.Render.ShadowCascadeLevels do
+                            // compute cull frustum
+                            let cullView = Matrix4x4.CreateLookAt (shadowOrigin, shadowOrigin + shadowForward, shadowUp)
+                            let cullProjection =
+                                Matrix4x4.CreateOrthographic
+                                    (shadowFarDistance * +2.0f * inc Constants.Render.ShadowCascadeMarginRatioCull,
+                                     shadowFarDistance * +2.0f * inc Constants.Render.ShadowCascadeMarginRatioCull,
+                                     shadowFarDistance * -1.0f * inc Constants.Render.ShadowCascadeMarginRatioCull,
+                                     shadowFarDistance * +1.0f * inc Constants.Render.ShadowCascadeMarginRatioCull)
+                            let cullFrustum = Frustum (cullView * cullProjection)
+                            
+                            // use a finally block to free cached values
+                            try
 
-                                // compute segment frustum
-                                let segmentNear =
-                                    match i with
-                                    | 0 -> Constants.Render.NearPlaneDistanceInterior
-                                    | _ -> shadowFarDistance * Constants.Render.ShadowCascadeLimits.[dec i]
-                                let segmentFar = shadowFarDistance * Constants.Render.ShadowCascadeLimits.[i]
-                                let segmentProjection = Matrix4x4.CreatePerspectiveFieldOfView (eyeFov, eyeAspectRatio, segmentNear, segmentFar)
-                                let segmentViewProjection = eyeView * segmentProjection
-                                let segmentFrustum = Frustum segmentViewProjection
+                                // gather simulants for rendering
+                                // OPTIMIZATION: gather simulants for all cascades so we can call
+                                // World.renderSimulantsInternal8.
+                                world.Timers.RenderGatherTimer.Restart ()
+                                let game = Nu.Game.Handle
+                                let screenOpt = World.getSelectedScreenOpt world
+                                let groups = match screenOpt with Some screen -> World.getGroups screen world | None -> Seq.empty
+                                let groupsInvisible =
+                                    if world.Accompanied
+                                    then hashSetPlus HashIdentity.Structural (Seq.filter (fun (group : Group) -> not (group.GetVisible world)) groups)
+                                    else hashSetPlus HashIdentity.Structural []
+                                let shadowInterior = LightType.shouldShadowInterior CascadedLight
+                                World.getElements3dInViewFrustum shadowInterior true cullFrustum HashSet3dNormalCached world
+                                World.getElements2dInView HashSet2dNormalCached world
+                                world.Timers.RenderGatherTimer.Stop ()
 
-                                // compute frustum corners and center in world space
-                                let segmentCornersWorld = segmentFrustum.Corners
-                                let segmentCenterWorld = Array.sum segmentCornersWorld / single segmentCornersWorld.Length
+                                // render cascades
+                                for i in 0 .. dec Constants.Render.ShadowCascadeLevels do
 
-                                // compute frustum corner bounds in world space
-                                let segmentViewOrtho = Matrix4x4.CreateLookAt (segmentCenterWorld, segmentCenterWorld + shadowForward, shadowUp)
-                                let mutable minX = Single.MaxValue
-                                let mutable maxX = Single.MinValue
-                                let mutable minY = Single.MaxValue
-                                let mutable maxY = Single.MinValue
-                                let mutable minZ = Single.MaxValue
-                                let mutable maxZ = Single.MinValue
-                                for corner in segmentCornersWorld do
-                                    let cornerView = corner.Transform segmentViewOrtho
-                                    minX <- min minX cornerView.X
-                                    maxX <- max maxX cornerView.X
-                                    minY <- min minY cornerView.Y
-                                    maxY <- max maxY cornerView.Y
-                                    minZ <- min minZ cornerView.Z
-                                    maxZ <- max maxZ cornerView.Z
+                                    // compute section frustum
+                                    let sectionNear =
+                                        match i with
+                                        | 0 -> Constants.Render.NearPlaneDistanceInterior
+                                        | _ -> shadowFarDistance * Constants.Render.ShadowCascadeLimits.[dec i]
+                                    let sectionFar = shadowFarDistance * Constants.Render.ShadowCascadeLimits.[i]
+                                    let sectionProjection = Matrix4x4.CreatePerspectiveFieldOfView (eyeFov, eyeAspectRatio, sectionNear, sectionFar)
+                                    let sectionViewProjection = eyeView * sectionProjection
+                                    let sectionFrustum = Frustum sectionViewProjection
 
-                                // overflow segment to avoid awkward clipping
-                                let zMult = Constants.Render.ShadowCascadeOverflow
-                                if minZ < 0.0f then minZ <- minZ * zMult else minZ <- minZ / zMult
-                                if maxZ < 0.0f then maxZ <- maxZ / zMult else maxZ <- maxZ * zMult
+                                    // compute frustum corners and center in world space
+                                    let sectionCornersWorld = sectionFrustum.Corners
+                                    let sectionCenterWorld = Array.sum sectionCornersWorld / single sectionCornersWorld.Length
 
-                                // snap segment center to shadow texel grid in light space to avoid shimmering
-                                //let eyeViewInverse = eyeView.Inverted
-                                //let segmentWidth = maxX - minX
-                                //let segmentHeight = maxY - minY
-                                //let shadowMapSize : Vector2 = world.GeometryViewport.ShadowTextureResolution.V2
-                                //let shadowTexelSize = v2 (segmentWidth / shadowMapSize.X) (segmentHeight / shadowMapSize.Y)
-                                //let segmentCenterShadow = segmentCenterWorld.Transform eyeView
-                                //let segmentCenterSnapped =
-                                //    v3
-                                //        (floor (segmentCenterShadow.X / shadowTexelSize.X) * shadowTexelSize.X)
-                                //        (floor (segmentCenterShadow.Y / shadowTexelSize.Y) * shadowTexelSize.Y)
-                                //        segmentCenterShadow.Z
-                                //let segmentCenterOrtho = segmentCenterSnapped.Transform eyeViewInverse
-                                //let segmentCenterOffset = segmentCenterOrtho - segmentCenterWorld
-                                //minX <- minX + segmentCenterOffset.X
-                                //maxX <- maxX + segmentCenterOffset.X
-                                //minY <- minY + segmentCenterOffset.Y
-                                //maxY <- maxY + segmentCenterOffset.Y
-                                
-                                // compute segment frustum and render
-                                let segmentProjectionOrtho = Matrix4x4.CreateOrthographicOffCenter (minX, maxX, minY, maxY, minZ, maxZ)
-                                let segmentViewProjectionOrtho = segmentViewOrtho * segmentProjectionOrtho
-                                let segmentFrustum = Frustum segmentViewProjectionOrtho
-                                World.renderSimulantsInternal (ShadowPass (lightId, Some (i, segmentViewOrtho, segmentProjectionOrtho), lightType, shadowRotation, segmentFrustum)) world
+                                    // compute frustum corner bounds in ortho space
+                                    let sectionViewOrtho = Matrix4x4.CreateLookAt (sectionCenterWorld, sectionCenterWorld + shadowForward, shadowUp)
+                                    let mutable minX = Single.MaxValue
+                                    let mutable maxX = Single.MinValue
+                                    let mutable minY = Single.MaxValue
+                                    let mutable maxY = Single.MinValue
+                                    let mutable minZ = Single.MaxValue
+                                    let mutable maxZ = Single.MinValue
+                                    for corner in sectionCornersWorld do
+                                        let cornerView = corner.Transform sectionViewOrtho
+                                        minX <- min minX cornerView.X
+                                        maxX <- max maxX cornerView.X
+                                        minY <- min minY cornerView.Y
+                                        maxY <- max maxY cornerView.Y
+                                        minZ <- min minZ cornerView.Z
+                                        maxZ <- max maxZ cornerView.Z
+
+                                    // add margins to section along Z's
+                                    let depth = maxZ - minZ
+                                    let margin = depth * Constants.Render.ShadowCascadeMarginRatio
+                                    let margin = max margin Constants.Render.ShadowCascadeMarginSizeMin
+                                    let minZ' = minZ - margin
+                                    let maxZ' = maxZ + margin
+
+                                    // compute ortho projection
+                                    let sectionProjectionOrtho = Matrix4x4.CreateOrthographicOffCenter (minX, maxX, minY, maxY, minZ', maxZ')
+
+                                    // render
+                                    World.renderSimulantsInternal8
+                                        game screenOpt groups groupsInvisible
+                                        HashSet3dNormalCached HashSet2dNormalCached
+                                        (ShadowPass (lightId, Some (i, sectionViewOrtho, sectionProjectionOrtho), lightType, shadowRotation, cullFrustum)) world
+
+                            // free cached values
+                            finally
+                                HashSet3dNormalCached.Clear ()
+                                HashSet2dNormalCached.Clear ()
 
                             // fin
                             shadowCascadesCount <- inc shadowCascadesCount
@@ -2371,7 +2431,7 @@ module EntityPropertyDescriptor =
         // change facet names
         | Constants.Engine.FacetNamesPropertyName ->
             let facetNames = value :?> string Set
-            World.trySetEntityFacetNames facetNames entity world
+            World.trySetEntityFacetNames facetNames entity world |> Either.mapRight ignore
 
         // change the property dynamically
         | _ ->
@@ -3144,6 +3204,7 @@ module WorldModule3 =
                         let presenceOld = entityState.Presence
                         let presenceInPlayOld = entityState.PresenceInPlay
                         let boundsOld = entityState.Bounds
+                        World.unregisterEntityIndex (getType entityState.Facets.[index]) entity world
                         if world.Imperative then
                             entityState.Facets.[index] <- facet
                         else
@@ -3151,12 +3212,13 @@ module WorldModule3 =
                             facets.[index] <- facet
                             let entityState = { entityState with Facets = facets }
                             World.setEntityState entityState entity world
+                        World.registerEntityIndex (getType facet) entity world
                         World.updateEntityInEntityTree visibleInViewOld staticInPlayOld lightProbeOld lightOld presenceOld presenceInPlayOld boundsOld entity world
                         World.updateEntityPresenceOverride entity world
                         World.attachEntityMissingProperties entity world
                     | None -> ()
-                | :? EntityDispatcher as entityDispatcher ->
-                    if getTypeName entityState.Dispatcher = getTypeName entityDispatcher then
+                | :? EntityDispatcher as dispatcher ->
+                    if getTypeName entityState.Dispatcher = getTypeName dispatcher then
                         let visibleInViewOld = entityState.VisibleInView
                         let staticInPlayOld = entityState.StaticInPlay
                         let lightProbeOld = entityState.LightProbe
@@ -3165,11 +3227,13 @@ module WorldModule3 =
                         let presenceInPlayOld = entityState.PresenceInPlay
                         let boundsOld = entityState.Bounds
                         let intrinsicFacetNamesOld = World.getEntityIntrinsicFacetNames entityState
+                        World.unregisterEntityIndex (getType entityState.Dispatcher) entity world
                         if world.Imperative then
-                            entityState.Dispatcher <- entityDispatcher
+                            entityState.Dispatcher <- dispatcher
                         else
-                            let entityState = { entityState with Dispatcher = entityDispatcher }
+                            let entityState = { entityState with Dispatcher = dispatcher }
                             World.setEntityState entityState entity world
+                        World.registerEntityIndex (getType dispatcher) entity world
                         World.updateEntityInEntityTree visibleInViewOld staticInPlayOld lightProbeOld lightOld presenceOld presenceInPlayOld boundsOld entity world
                         let entityState = World.getEntityState entity world
                         let intrinsicFacetNamesNew = World.getEntityIntrinsicFacetNames entityState
@@ -3183,25 +3247,25 @@ module WorldModule3 =
             | :? Group as group ->
                 let groupState = World.getGroupState group world
                 match lateBindings with
-                | :? GroupDispatcher as groupDispatcher ->
-                    if getTypeName groupState.Dispatcher = getTypeName groupDispatcher then
-                        World.setGroupState { groupState with Dispatcher = groupDispatcher } group world
+                | :? GroupDispatcher as dispatcher ->
+                    if getTypeName groupState.Dispatcher = getTypeName dispatcher then
+                        World.setGroupState { groupState with Dispatcher = dispatcher } group world
                         World.attachGroupMissingProperties group world
                 | _ -> ()
             | :? Screen as screen ->
                 let screenState = World.getScreenState screen world
                 match lateBindings with
-                | :? ScreenDispatcher as screenDispatcher ->
-                    if getTypeName screenState.Dispatcher = getTypeName screenDispatcher then
-                        World.setScreenState { screenState with Dispatcher = screenDispatcher } screen world
+                | :? ScreenDispatcher as dispatcher ->
+                    if getTypeName screenState.Dispatcher = getTypeName dispatcher then
+                        World.setScreenState { screenState with Dispatcher = dispatcher } screen world
                         World.attachScreenMissingProperties screen world
                 | _ -> ()
             | :? Game as game ->
                 let gameState = World.getGameState game world
                 match lateBindings with
-                | :? GameDispatcher as gameDispatcher ->
-                    if getTypeName gameState.Dispatcher = getTypeName gameDispatcher then
-                        World.setGameState { gameState with Dispatcher = gameDispatcher } game world
+                | :? GameDispatcher as dispatcher ->
+                    if getTypeName gameState.Dispatcher = getTypeName dispatcher then
+                        World.setGameState { gameState with Dispatcher = dispatcher } game world
                         World.attachGameMissingProperties game world
                 | _ -> ()
             | _ -> failwithumf ()
