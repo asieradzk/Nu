@@ -7,13 +7,11 @@ open MyGame  // For TestBasicShader type
 
 let SkyImage : Image AssetTag = { PackageName = "MyGame"; AssetName = "cartoonsky_f" }
 let CloudImage : Image AssetTag = { PackageName = "MyGame"; AssetName = "cartooncloudsmall_f" }
-let CloudSpeed = 30f
-
-let CloudScale = 0.3f
-let CloudOpacity = 0.7f
-
 
 let render world =
+    // Constants defined here to ensure proper initialization
+    let CloudSpeed = 30f
+    let CloudOpacity = 0.7f
     let virtualSize = Game.GetEye2dSize world
     let time = world.GameTime.Seconds
 
@@ -40,7 +38,7 @@ let render world =
     World.doStaticSprite "CloudSprite" [
         Entity.StaticImage .= CloudImage
         Entity.Position @= v3 positionX 65f 0.0f
-        Entity.Scale .= v3 CloudScale CloudScale CloudScale
+        Entity.Scale .= v3 0.3f 0.3f 0.3f
         Entity.Size .= v3 256f 256f 0f
         Entity.Color .= colorWithOpacity
         Entity.ElevationLocal .= 1.0f    

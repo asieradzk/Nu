@@ -40,18 +40,6 @@ module Xtension =
         let mutable propertyRef = Unchecked.defaultof<_>
         match UMap.tryGetValue (name, xtension.Properties, &propertyRef) with
         | true ->
-            if property.PropertyType <> propertyRef.PropertyType then
-#if DEBUG
-                // Allow F# Interactive type reloads in Gaia development.
-                // FSI prefixes module types with FSI_XXXX. on each reload, causing type inequality
-                // even for structurally identical types. Strip these prefixes before comparison.
-                let inline stripFsiPrefix (typeName : string) =
-                    System.Text.RegularExpressions.Regex.Replace(typeName, @"^FSI_\d+\.", "")
-                let newTypeName = stripFsiPrefix property.PropertyType.FullName
-                let existingTypeName = stripFsiPrefix propertyRef.PropertyType.FullName
-                if newTypeName <> existingTypeName then
-#endif
-                    failwith "Cannot change the type of an existing Xtension property."
             if xtension.Imperative then
                 propertyRef.PropertyValue <- property.PropertyValue
                 struct (true, xtension)
